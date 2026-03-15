@@ -66,21 +66,24 @@ void _stripPathFilename(fs::path& path)
 		path = path.parent_path();
 }
 
-std::list<fs::path> _getCachesPaths(const TitleId& titleId)
+std::vector<fs::path> _getCachesPaths(const TitleId& titleId)
 {
-	std::list<fs::path> cachePaths{
+	std::vector<fs::path> cachePaths{
 		ActiveSettings::GetCachePath(L"shaderCache/driver/vk/{:016x}.bin", titleId),
 		ActiveSettings::GetCachePath(L"shaderCache/precompiled/{:016x}_spirv.bin", titleId),
 		ActiveSettings::GetCachePath(L"shaderCache/precompiled/{:016x}_gl.bin", titleId),
+		ActiveSettings::GetCachePath(L"shaderCache/precompiled/{:016x}_air.bin", titleId),
 		ActiveSettings::GetCachePath(L"shaderCache/transferable/{:016x}_shaders.bin", titleId),
-		ActiveSettings::GetCachePath(L"shaderCache/transferable/{:016x}_vkpipeline.bin", titleId)};
+		ActiveSettings::GetCachePath(L"shaderCache/transferable/{:016x}_mtlshaders.bin", titleId),
+		ActiveSettings::GetCachePath(L"shaderCache/transferable/{:016x}_vkpipeline.bin", titleId),
+		ActiveSettings::GetCachePath(L"shaderCache/transferable/{:016x}_mtlpipeline.bin", titleId)};
 
-	cachePaths.remove_if(
-		[](const fs::path& cachePath)
-		{
-			std::error_code ec;
-			return !fs::exists(cachePath, ec);
-		});
+	cachePaths.erase(std::remove_if(cachePaths.begin(), cachePaths.end(),
+									[](const fs::path& cachePath) {
+										std::error_code ec;
+										return !fs::exists(cachePath, ec);
+									}),
+					 cachePaths.end());
 
 	return cachePaths;
 }
@@ -141,17 +144,15 @@ wxGameList::wxGameList(wxWindow* parent, wxWindowID id)
 	const auto& config = GetWxGUIConfig();
 
 	char transparent_bitmap[kIconWidth * kIconWidth * 4] = {};
-	memset((void*)transparent_bitmap, wxSystemSettings::GetAppearance().IsDark() ? 0xFF : 0x00, sizeof(transparent_bitmap));
+	memset(transparent_bitmap, wxSystemSettings::GetAppearance().IsDark() ? 0xFF : 0x00, sizeof(transparent_bitmap));
 	wxBitmap blank(transparent_bitmap, kIconWidth, kIconWidth);
 
-	m_image_list_data = {};
-	m_image_list_data.emplace_back(wxBitmapBundle::FromBitmap(blank));
-	wxListCtrl::SetNormalImages(m_image_list_data);
+	m_image_list_data.Add(blank);
+	wxListCtrl::SetImageList(&m_image_list_data, wxIMAGE_LIST_NORMAL);
 
-	m_image_list_small_data = {};
 	wxBitmap::Rescale(blank, {kListIconWidth, kListIconWidth});
-	m_image_list_small_data.emplace_back(wxBitmapBundle::FromBitmap(blank));
-	wxListCtrl::SetSmallImages(m_image_list_small_data);
+	m_image_list_small_data.Add(blank);
+	wxListCtrl::SetImageList(&m_image_list_small_data, wxIMAGE_LIST_SMALL);
 
 	InsertColumn(ColumnHiddenName, "", wxLIST_FORMAT_LEFT, 0);
 	if(config.show_icon_column)
@@ -189,6 +190,7 @@ wxGameList::wxGameList(wxWindow* parent, wxWindowID id)
 	Bind(wxEVT_LIST_COL_END_DRAG, &wxGameList::OnColumnResize, this);
 	Bind(wxEVT_LIST_COL_RIGHT_CLICK, &wxGameList::OnColumnRightClick, this);
 	Bind(wxEVT_SIZE, &wxGameList::OnGameListSize, this);
+	m_bulkUpdateTimer.Bind(wxEVT_TIMER, &wxGameList::OnTimerBulkAddEntriesToGameList, this);
 
 	m_callbackIdTitleList = CafeTitleList::RegisterCallback([](CafeTitleListCallbackEvent* evt, void* ctx) { ((wxGameList*)ctx)->HandleTitleListCallback(evt); }, this);
 
@@ -251,13 +253,13 @@ void wxGameList::OnGameListSize(wxSizeEvent &event)
 	for(int i = GetColumnCount() - 1; i > 0; i--)
 	{
 #ifdef wxHAS_LISTCTRL_COLUMN_ORDER
-		if(GetColumnWidth(GetColumnIndexFromOrder(i)) > 0) 
+		if(GetColumnWidth(GetColumnIndexFromOrder(i)) > 0)
 		{
 			last_col_index = GetColumnIndexFromOrder(i);
 			break;
 		}
 #else
-		if(GetColumnWidth(i) > 0) 
+		if(GetColumnWidth(i) > 0)
 		{
 			last_col_index = i;
 			break;
@@ -302,13 +304,7 @@ int wxGameList::GetColumnDefaultWidth(int column)
 	switch (column)
 	{
 	case ColumnIcon:
-#if __WXMSW__
-		// note: this is another workaround that could be used to fix the icon offset, but instead of this there's a vcpkg patch for wxWidgets that fixes the icon offset
-		// wxWidgets offsets the icon in the REPORT view so it's cut off if the column width is set to 64px, see https://github.com/wxWidgets/wxWidgets/blob/09f433faf39aab3f25b3c564b82448bb845fae56/src/msw/listctrl.cpp#L3091
-		// so add 6px to the column width to compensate, and add another 6px to the right side so that it has equal whitespace on both sides
-		// return kListIconWidth + 6 + 6;
-#endif
-		return kListIconWidth;
+		return kListIconWidth+2;
 	case ColumnName:
 		return DefaultColumnSize::name;
 	case ColumnVersion:
@@ -350,7 +346,7 @@ bool wxGameList::IsVisible(long item) const
 	return visible;
 }
 
-void wxGameList::ReloadGameEntries(bool cached)
+void wxGameList::ReloadGameEntries()
 {
 	wxWindowUpdateLocker windowlock(this);
 	DeleteAllItems();
@@ -410,11 +406,13 @@ void wxGameList::SetStyle(Style style, bool save)
 	switch(style)
 	{
 	case Style::kIcons:
-		wxListCtrl::SetNormalImages(m_image_list_data);
+		wxListCtrl::SetImageList(&m_image_list_data, wxIMAGE_LIST_NORMAL);
 		break;
 	case Style::kSmallIcons:
+		wxListCtrl::SetImageList(&m_image_list_small_data, wxIMAGE_LIST_NORMAL);
+		break;
 	case Style::kList:
-		wxListCtrl::SetSmallImages(m_image_list_small_data);
+		wxListCtrl::SetImageList(&m_image_list_small_data, wxIMAGE_LIST_SMALL);
 		break;
 	}
 
@@ -443,7 +441,7 @@ long wxGameList::GetStyleFlags(Style style) const
 	switch (style)
 	{
 	case Style::kList:
-		return (wxLC_SINGLE_SEL | wxLC_REPORT);
+		return (wxLC_SINGLE_SEL | wxLC_VRULES | wxLC_REPORT);
 	case Style::kIcons:
 		return (wxLC_SINGLE_SEL | wxLC_ICON);
 	case Style::kSmallIcons:
@@ -458,25 +456,22 @@ void wxGameList::UpdateItemColors(sint32 startIndex)
 {
     wxWindowUpdateLocker lock(this);
 
-	wxColour bgColourPrimary = GetBackgroundColour();
-	wxColour bgColourSecondary = wxHelper::CalculateAccentColour(bgColourPrimary);
-
     for (int i = startIndex; i < GetItemCount(); ++i)
     {
-        const auto titleId = (uint64)GetItemData(i);
+        const uint64 titleId = GetItemData(i);
 		if (GetConfig().IsGameListFavorite(titleId))
 		{
 			SetItemBackgroundColour(i, kFavoriteColor);
 			SetItemTextColour(i, wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
 		}
-		else if ((i&1) != 0)
+		else if ((i % 2) != 0)
 		{
-            SetItemBackgroundColour(i, bgColourPrimary);
+            SetItemBackgroundColour(i, kPrimaryColor);
             SetItemTextColour(i, wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
 		}
 		else
 		{
-            SetItemBackgroundColour(i, bgColourSecondary);
+            SetItemBackgroundColour(i, kAlternateColor);
             SetItemTextColour(i, wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT));
 		}
 	}
@@ -484,7 +479,7 @@ void wxGameList::UpdateItemColors(sint32 startIndex)
 
 static inline int order_to_int(const std::weak_ordering &wo)
 {
-	// no easy conversion seems to exists in C++20
+	// no easy conversion seems to exist in C++20
 	if (wo == std::weak_ordering::less)
 		return -1;
 	else if (wo == std::weak_ordering::greater)
@@ -496,26 +491,23 @@ std::weak_ordering wxGameList::SortComparator(uint64 titleId1, uint64 titleId2, 
 {
 	auto titleLastPlayed = [](uint64_t id)
 	{
-	  iosu::pdm::GameListStat playTimeStat{};
-	  iosu::pdm::GetStatForGamelist(id, playTimeStat);
-	  return playTimeStat;
+		iosu::pdm::GameListStat playTimeStat{};
+		iosu::pdm::GetStatForGamelist(id, playTimeStat);
+		return playTimeStat;
 	};
 
 	auto titlePlayMinutes = [](uint64_t id)
 	{
-	  iosu::pdm::GameListStat playTimeStat;
-	  if (!iosu::pdm::GetStatForGamelist(id, playTimeStat))
-		  return 0u;
-	  return playTimeStat.numMinutesPlayed;
+		iosu::pdm::GameListStat playTimeStat;
+		if (!iosu::pdm::GetStatForGamelist(id, playTimeStat))
+			return 0u;
+		return playTimeStat.numMinutesPlayed;
 	};
 
 	auto titleRegion = [](uint64_t id)
 	{
-	  return CafeTitleList::GetGameInfo(id).GetRegion();
+		return CafeTitleList::GetGameInfo(id).GetRegion();
 	};
-
-	if (!sortData->asc)
-		std::swap(titleId1, titleId2);
 
 	switch(sortData->column)
 	{
@@ -545,7 +537,7 @@ std::weak_ordering wxGameList::SortComparator(uint64 titleId1, uint64 titleId2, 
 int wxGameList::SortFunction(wxIntPtr item1, wxIntPtr item2, wxIntPtr sortData)
 {
 	const auto sort_data = (SortData*)sortData;
-	return order_to_int(sort_data->thisptr->SortComparator((uint64)item1, (uint64)item2, sort_data));
+	return sort_data->dir * order_to_int(sort_data->thisptr->SortComparator((uint64)item1, (uint64)item2, sort_data));
 }
 
 void wxGameList::SortEntries(int column)
@@ -569,7 +561,7 @@ void wxGameList::SortEntries(int column)
 	case ColumnRegion:
 	case ColumnTitleID:
 	{
-		SortData data{this, ItemColumns{column}, ascending};
+		SortData data{this, ItemColumns{column}, ascending ? 1 : -1};
 		SortItems(SortFunction, (wxIntPtr)&data);
 		ShowSortIndicator(column, ascending);
 		break;
@@ -721,14 +713,14 @@ void wxGameList::OnContextMenuSelected(wxCommandEvent& event)
 				GetConfig().SetGameListFavorite(title_id, !GetConfig().IsGameListFavorite(title_id));
 				SortEntries();
 				UpdateItemColors();
-				//SaveConfig();
+				SaveConfig(true);
 				break;
 			case kContextMenuEditName:
 			{
 				std::string customName = "";
 				if (!GetConfig().GetGameListCustomName(title_id, customName))
 					customName.clear();
-				wxTextEntryDialog dialog(this, wxEmptyString, _("Enter a custom game title"), wxHelper::FromUtf8(customName));
+				wxTextEntryDialog dialog(this, wxEmptyString, _("Enter a custom game title"), wxString::FromUTF8(customName));
 				if(dialog.ShowModal() == wxID_OK)
 				{
 					const auto custom_name = dialog.GetValue();
@@ -742,7 +734,7 @@ void wxGameList::OnContextMenuSelected(wxCommandEvent& event)
 						if (id == title_id)
 						{
 							if (m_style == Style::kList)
-								SetItem(i, ColumnName, wxHelper::FromUtf8(GetNameByTitleId(title_id)));
+								SetItem(i, ColumnName, wxString::FromUTF8(GetNameByTitleId(title_id)));
 							break;
 						}
 					}
@@ -769,7 +761,7 @@ void wxGameList::OnContextMenuSelected(wxCommandEvent& event)
 					wxASSERT(!tokens.empty());
 					const std::string company_code = gameInfo.GetBase().GetMetaInfo()->GetCompanyCode();
 					wxASSERT(company_code.size() >= 2);
-					wxLaunchDefaultBrowser(wxHelper::FromUtf8(fmt::format("https://wiki.cemu.info/wiki/{}{}", *tokens.rbegin(), company_code.substr(company_code.size() - 2).c_str())));
+					wxLaunchDefaultBrowser(formatWxString("https://wiki.cemu.info/wiki/{}{}", *tokens.rbegin(), company_code.substr(company_code.size() - 2)));
 				}
 				break;
 				}
@@ -840,8 +832,8 @@ void wxGameList::OnContextMenuSelected(wxCommandEvent& event)
                     int icon_small;
                     if (!QueryIconForTitle(title_id, icon_large, icon_small))
                         break;
-                    auto icon = m_image_list_data[icon_large];
-                	auto newClipboardData = wxBitmapDataObject(icon.GetBitmap(icon.GetDefaultSize()));
+                    auto icon = m_image_list_data.GetIcon(icon_large);
+                	auto newClipboardData = wxBitmapDataObject(icon);
                     wxClipboard::Get()->SetData(&newClipboardData);
                     wxClipboard::Get()->Close();
                 }
@@ -854,7 +846,7 @@ void wxGameList::OnContextMenuSelected(wxCommandEvent& event)
 	switch (event.GetId())
 	{
 	case kContextMenuRefreshGames:
-		ReloadGameEntries(false);
+		ReloadGameEntries();
 		break;
 	case kContextMenuStyleList:
 		SetStyle(Style::kList);
@@ -1002,7 +994,7 @@ void wxGameList::ApplyGameListColumnWidths()
 	const auto& config = GetWxGUIConfig();
 	wxWindowUpdateLocker lock(this);
 	if(config.show_icon_column)
-		SetColumnWidth(ColumnIcon, GetColumnDefaultWidth(ColumnIcon));
+		SetColumnWidth(ColumnIcon, kListIconWidth+2);
 	else
 		SetColumnWidth(ColumnIcon, 0);
 	SetColumnWidth(ColumnName, config.column_width.name);
@@ -1024,13 +1016,13 @@ void wxGameList::OnColumnBeginResize(wxListEvent& event)
 	for(int i = GetColumnCount() - 1; i > 0; i--)
 	{
 #ifdef wxHAS_LISTCTRL_COLUMN_ORDER
-		if(GetColumnWidth(GetColumnIndexFromOrder(i)) > 0) 
+		if(GetColumnWidth(GetColumnIndexFromOrder(i)) > 0)
 		{
 			last_col_index = GetColumnIndexFromOrder(i);
 			break;
 		}
 #else
-		if(GetColumnWidth(i) > 0) 
+		if(GetColumnWidth(i) > 0)
 		{
 			last_col_index = i;
 			break;
@@ -1088,125 +1080,142 @@ void wxGameList::OnClose(wxCloseEvent& event)
 	m_exit = true;
 }
 
-int wxGameList::FindInsertPosition(TitleId titleId)
+int wxGameList::FindInsertPosition(TitleId titleId, bool& entryAlreadyExists)
 {
+	entryAlreadyExists = false;
 	SortData data{this, ItemColumns(GetSortIndicator()), IsAscendingSortIndicator()};
 	const auto itemCount = GetItemCount();
+
 	if (itemCount == 0)
 		return 0;
-	// todo - optimize this with binary search
-
-	for (int i = 0; i < itemCount; i++)
+	sint32 low = 0;
+	sint32 high = itemCount;
+	while (low < high)
 	{
-		if (SortComparator(titleId, (uint64)GetItemData(i), &data) <= 0)
-			return i;
+		sint32 mid = low + (high - low) / 2;
+		auto cmp = SortComparator(titleId, (uint64)GetItemData(mid), &data);
+		if (cmp <= 0)
+		{
+			if (cmp == 0)
+			{
+				entryAlreadyExists = true;
+				return mid;
+			}
+			high = mid;
+		}
+		else
+		{
+			low = mid + 1;
+		}
 	}
-	return itemCount;
+	return low;
+}
+
+void wxGameList::OnTimerBulkAddEntriesToGameList(wxTimerEvent& event)
+{
+	std::vector<TitleId> titleIdsToUpdate;
+	std::swap(titleIdsToUpdate, m_bulkTitlesToAdd);
+
+	wxWindowUpdateLocker lock(this);
+	bool hasAnyNewEntry = false;
+	for (auto& titleId : titleIdsToUpdate)
+	{
+		GameInfo2 gameInfo = CafeTitleList::GetGameInfo(titleId);
+		if (!gameInfo.IsValid() || gameInfo.IsSystemDataTitle())
+		{
+			// entry no longer exists or is not a valid game
+			// we dont need to remove list entries here because all delete operations should trigger a full list refresh
+			continue;
+		}
+		TitleId baseTitleId = gameInfo.GetBaseTitleId();
+		bool isNewEntry = false;
+
+		int icon = -1; /* 0 is the default empty icon */
+		int icon_small = -1; /* 0 is the default empty icon */
+		QueryIconForTitle(baseTitleId, icon, icon_small);
+
+		bool entryAlreadyExists = false;
+		auto index = FindInsertPosition(baseTitleId, entryAlreadyExists);
+		if(!entryAlreadyExists)
+		{
+			// entry doesn't exist
+			index = InsertItem(index, wxString::FromUTF8(GetNameByTitleId(baseTitleId)));
+			SetItemPtrData(index, baseTitleId);
+			isNewEntry = true;
+			hasAnyNewEntry = true;
+		}
+
+		if (m_style == Style::kList)
+		{
+			SetItemColumnImage(index, ColumnIcon, icon_small);
+
+			SetItem(index, ColumnName, wxString::FromUTF8(GetNameByTitleId(baseTitleId)));
+
+			SetItem(index, ColumnVersion, fmt::format("{}", gameInfo.GetVersion()));
+
+			if(gameInfo.HasAOC())
+				SetItem(index, ColumnDLC, fmt::format("{}", gameInfo.GetAOCVersion()));
+			else
+				SetItem(index, ColumnDLC, wxString());
+
+			if (isNewEntry)
+			{
+				iosu::pdm::GameListStat playTimeStat;
+				if (iosu::pdm::GetStatForGamelist(baseTitleId, playTimeStat))
+				{
+					// time played
+					uint32 minutesPlayed = playTimeStat.numMinutesPlayed;
+					if (minutesPlayed == 0)
+						SetItem(index, ColumnGameTime, wxEmptyString);
+					else if (minutesPlayed < 60)
+						SetItem(index, ColumnGameTime, formatWxString(wxPLURAL("{} minute", "{} minutes", minutesPlayed), minutesPlayed));
+					else
+					{
+						uint32 hours = minutesPlayed / 60;
+						uint32 minutes = minutesPlayed % 60;
+						wxString hoursText = formatWxString(wxPLURAL("{} hour", "{} hours", hours), hours);
+						wxString minutesText = formatWxString(wxPLURAL("{} minute", "{} minutes", minutes), minutes);
+						SetItem(index, ColumnGameTime, hoursText + " " + minutesText);
+					}
+
+					// last played
+					if (playTimeStat.last_played.year != 0)
+					{
+						const wxDateTime tmp((wxDateTime::wxDateTime_t)playTimeStat.last_played.day, (wxDateTime::Month)playTimeStat.last_played.month, (wxDateTime::wxDateTime_t)playTimeStat.last_played.year, 0, 0, 0, 0);
+						SetItem(index, ColumnGameStarted, tmp.FormatDate());
+					}
+					else
+						SetItem(index, ColumnGameStarted, _("never"));
+				}
+				else
+				{
+					SetItem(index, ColumnGameTime, wxEmptyString);
+					SetItem(index, ColumnGameStarted, _("never"));
+				}
+			}
+			const auto region_text = fmt::format("{}", gameInfo.GetRegion());
+			SetItem(index, ColumnRegion, wxGetTranslation(region_text));
+	        SetItem(index, ColumnTitleID, fmt::format("{:016x}", baseTitleId));
+		}
+		else if (m_style == Style::kIcons)
+		{
+			SetItemImage(index, icon);
+		}
+		else if (m_style == Style::kSmallIcons)
+		{
+			SetItemImage(index, icon_small);
+		}
+	}
+	if (hasAnyNewEntry)
+		UpdateItemColors();
 }
 
 void wxGameList::OnGameEntryUpdatedByTitleId(wxTitleIdEvent& event)
 {
+	if (m_bulkTitlesToAdd.size() < 100)
+		m_bulkUpdateTimer.StartOnce(100); // if timer is started already this will delay it
 	const auto titleId = event.GetTitleId();
-	GameInfo2 gameInfo = CafeTitleList::GetGameInfo(titleId);
-	if (!gameInfo.IsValid() || gameInfo.IsSystemDataTitle())
-	{
-		// entry no longer exists or is not a valid game
-		// we dont need to remove list entries here because all delete operations should trigger a full list refresh
-		return;
-	}
-	TitleId baseTitleId = gameInfo.GetBaseTitleId();
-	bool isNewEntry = false;
-
-	if (m_style == Style::kIcons)
-	{
-		wxListCtrl::SetNormalImages(m_image_list_data);
-	}
-	else if (m_style == Style::kSmallIcons)
-	{
-		wxListCtrl::SetSmallImages(m_image_list_small_data);
-	}
-	else if (m_style == Style::kList)
-	{
-		wxListCtrl::SetSmallImages(m_image_list_small_data);
-	}
-
-	int icon = -1; /* 0 is the default empty icon */
-	int icon_small = -1; /* 0 is the default empty icon */
-	QueryIconForTitle(baseTitleId, icon, icon_small);
-
-	auto index = FindListItemByTitleId(baseTitleId);
-	if(index == wxNOT_FOUND)
-	{
-		// entry doesn't exist
-		index = InsertItem(FindInsertPosition(baseTitleId), wxHelper::FromUtf8(GetNameByTitleId(baseTitleId)));
-		SetItemPtrData(index, baseTitleId);
-		isNewEntry = true;
-	}
-
-	if (m_style == Style::kList)
-	{
-		SetItemColumnImage(index, ColumnIcon, icon_small);
-
-		SetItem(index, ColumnName, wxHelper::FromUtf8(GetNameByTitleId(baseTitleId)));
-
-		SetItem(index, ColumnVersion, fmt::format("{}", gameInfo.GetVersion()));
-
-		if(gameInfo.HasAOC())
-			SetItem(index, ColumnDLC, fmt::format("{}", gameInfo.GetAOCVersion()));
-		else
-			SetItem(index, ColumnDLC, wxString());
-
-		if (isNewEntry)
-		{
-			iosu::pdm::GameListStat playTimeStat;
-			if (iosu::pdm::GetStatForGamelist(baseTitleId, playTimeStat))
-			{
-				// time played
-				uint32 minutesPlayed = playTimeStat.numMinutesPlayed;
-				if (minutesPlayed == 0)
-					SetItem(index, ColumnGameTime, wxEmptyString);
-				else if (minutesPlayed < 60)
-					SetItem(index, ColumnGameTime, formatWxString(wxPLURAL("{} minute", "{} minutes", minutesPlayed), minutesPlayed));
-				else
-				{
-					uint32 hours = minutesPlayed / 60;
-					uint32 minutes = minutesPlayed % 60;
-					wxString hoursText = formatWxString(wxPLURAL("{} hour", "{} hours", hours), hours);
-					wxString minutesText = formatWxString(wxPLURAL("{} minute", "{} minutes", minutes), minutes);
-					SetItem(index, ColumnGameTime, hoursText + " " + minutesText);
-				}
-				
-				// last played
-				if (playTimeStat.last_played.year != 0)
-				{
-					const wxDateTime tmp((wxDateTime::wxDateTime_t)playTimeStat.last_played.day, (wxDateTime::Month)playTimeStat.last_played.month, (wxDateTime::wxDateTime_t)playTimeStat.last_played.year, 0, 0, 0, 0);
-					SetItem(index, ColumnGameStarted, tmp.FormatDate());
-				}
-				else
-					SetItem(index, ColumnGameStarted, _("never"));
-			}
-			else
-			{
-				SetItem(index, ColumnGameTime, wxEmptyString);
-				SetItem(index, ColumnGameStarted, _("never"));
-			}
-		}
-
-
-		const auto region_text = fmt::format("{}", gameInfo.GetRegion());
-		SetItem(index, ColumnRegion, wxGetTranslation(region_text));
-        SetItem(index, ColumnTitleID, fmt::format("{:016x}", baseTitleId));
-	}
-	else if (m_style == Style::kIcons)
-	{
-		SetItemImage(index, icon);
-	}
-	else if (m_style == Style::kSmallIcons)
-	{
-		SetItemImage(index, icon_small);
-	}
-	if (isNewEntry)
-		UpdateItemColors(index);
+	m_bulkTitlesToAdd.emplace_back(titleId);
 }
 
 void wxGameList::OnItemActivated(wxListEvent& event)
@@ -1280,7 +1289,7 @@ void wxGameList::HandleTitleListCallback(CafeTitleListCallbackEvent* evt)
 	}
 }
 
-void wxGameList::RemoveCache(const std::list<fs::path>& cachePaths, const std::string& titleName)
+void wxGameList::RemoveCache(const std::vector<fs::path>& cachePaths, const std::string& titleName)
 {
 	wxMessageDialog dialog(this, formatWxString(_("Remove the shader caches for {}?"), titleName), _("Remove shader caches"), wxCENTRE | wxYES_NO | wxICON_EXCLAMATION);
 	dialog.SetYesNoLabels(_("Yes"), _("No"));
@@ -1288,7 +1297,7 @@ void wxGameList::RemoveCache(const std::list<fs::path>& cachePaths, const std::s
 	const auto dialogResult = dialog.ShowModal();
 	if (dialogResult != wxID_YES)
 		return;
-	std::list<std::string> errs;
+	std::vector<std::string> errs;
 	for (const fs::path& cachePath : cachePaths)
 	{
 		if (std::error_code ec; !fs::remove(cachePath, ec))
@@ -1345,18 +1354,17 @@ void wxGameList::AsyncWorkerThread()
 			wxMemoryInputStream tmp_stream(tgaData->data(), tgaData->size());
 			const wxImage image(tmp_stream);
 			// todo - is wxImageList thread safe?
-			m_image_list_data.emplace_back(image.Scale(kIconWidth, kIconWidth, wxIMAGE_QUALITY_BICUBIC));
-			m_image_list_small_data.emplace_back(image.Scale(kListIconWidth, kListIconWidth, wxIMAGE_QUALITY_BICUBIC));
+			int icon = m_image_list_data.Add(image.Scale(kIconWidth, kIconWidth, wxIMAGE_QUALITY_BICUBIC));
+			int icon_small = m_image_list_small_data.Add(image.Scale(kListIconWidth, kListIconWidth, wxIMAGE_QUALITY_BICUBIC));
 			// store in cache
 			m_icon_cache_mtx.lock();
-			m_icon_cache.try_emplace(titleId, m_image_list_data.size() - 1, m_image_list_small_data.size() - 1);
+			m_icon_cache.try_emplace(titleId, icon, icon_small);
 			m_icon_cache_mtx.unlock();
 			iconSuccessfullyLoaded = true;
 		}
 		else
 		{
 			cemuLog_log(LogType::Force, "Failed to load icon for title {:016x}", titleId);
-			cemu_assert_debug(false);
 		}
 		titleInfo.Unmount(tempMountPath);
 		// notify UI about loaded icon
@@ -1390,7 +1398,7 @@ bool wxGameList::QueryIconForTitle(TitleId titleId, int& icon, int& iconSmall)
 	return true;
 }
 
-void wxGameList::DeleteCachedStrings() 
+void wxGameList::DeleteCachedStrings()
 {
 	m_name_cache.clear();
 }
@@ -1415,9 +1423,9 @@ void wxGameList::CreateShortcut(GameInfo2& gameInfo)
 	// Obtain and convert icon
 	[&]()
 	{
-		int iconIndex, smallIconIndex;
+		int iconIdx, smallIconIdx;
 
-		if (!QueryIconForTitle(titleId, iconIndex, smallIconIndex))
+		if (!QueryIconForTitle(titleId, iconIdx, smallIconIdx))
 		{
 			cemuLog_log(LogType::Force, "Icon hasn't loaded");
 			return;
@@ -1433,8 +1441,8 @@ void wxGameList::CreateShortcut(GameInfo2& gameInfo)
 		iconPath = outIconDir / fmt::format("{:016x}.png", gameInfo.GetBaseTitleId());
 		wxFileOutputStream pngFileStream(_pathToUtf8(iconPath.value()));
 
-		const auto icon = m_image_list_data[iconIndex];
-		wxBitmap bitmap{icon.GetBitmap(wxDefaultSize)};
+		const auto icon = m_image_list_data.GetIcon(iconIdx);
+		wxBitmap bitmap{icon};
 		wxImage image = bitmap.ConvertToImage();
 		wxPNGHandler pngHandler;
 		if (!pngHandler.SaveFile(&image, pngFileStream, false))
@@ -1508,9 +1516,9 @@ void wxGameList::CreateShortcut(GameInfo2& gameInfo)
 	// Obtain and convert icon
 	[&]()
 	{
-		int iconIndex, smallIconIndex;
+		int iconIdx, smallIconIdx;
 
-		if (!QueryIconForTitle(titleId, iconIndex, smallIconIndex))
+		if (!QueryIconForTitle(titleId, iconIdx, smallIconIdx))
 		{
 			cemuLog_log(LogType::Force, "Icon hasn't loaded");
 			return;
@@ -1526,8 +1534,8 @@ void wxGameList::CreateShortcut(GameInfo2& gameInfo)
 		iconPath = outIconDir / fmt::format("{:016x}.png", gameInfo.GetBaseTitleId());
 		wxFileOutputStream pngFileStream(_pathToUtf8(iconPath.value()));
 
-		const auto icon = m_image_list_data[iconIndex];
-		wxBitmap bitmap{icon.GetBitmap(wxDefaultSize)};
+		const auto icon = m_image_list_data.GetIcon(iconIdx);
+		wxBitmap bitmap{icon};
 		wxImage image = bitmap.ConvertToImage();
 		wxPNGHandler pngHandler;
 		if (!pngHandler.SaveFile(&image, pngFileStream, false))
@@ -1635,14 +1643,14 @@ void wxGameList::CreateShortcut(GameInfo2& gameInfo)
 			cemuLog_log(LogType::Force, "Icon hasn't loaded");
 			return;
 		}
-		const auto icon = m_image_list_data[iconIdx];
+		const auto icon = m_image_list_data.GetIcon(iconIdx);
 		const auto folder = ActiveSettings::GetUserDataPath("icons");
 		if (!fs::exists(folder) && !fs::create_directories(folder))
 		{
 			cemuLog_log(LogType::Force, "Failed to create icon directory");
 			return;
 		}
-		wxBitmap bitmap{icon.GetBitmap(wxDefaultSize)};
+		wxBitmap bitmap{icon};
 
 		icon_path = folder / fmt::format("{:016x}.ico", titleId);
 		auto stream = wxFileOutputStream(icon_path->wstring());

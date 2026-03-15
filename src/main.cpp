@@ -96,12 +96,12 @@ void WindowsInitCwd()
 {
 	#if BOOST_OS_WINDOWS
 	executablePath.resize(4096);
-	int i = GetModuleFileName(NULL, executablePath.data(), executablePath.size());
+	int i = GetModuleFileNameW(NULL, executablePath.data(), executablePath.size());
 	if(i >= 0)
 		executablePath.resize(i);
 	else
 		executablePath.clear();
-	SetCurrentDirectory(executablePath.c_str());
+	SetCurrentDirectoryW(executablePath.c_str());
 	// set high priority
 	SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 	#endif
@@ -167,18 +167,28 @@ void UnitTests()
 bool isConsoleConnected = false;
 void requireConsole()
 {
-	#if BOOST_OS_WINDOWS
-	if (isConsoleConnected)
-		return;
+    #if BOOST_OS_WINDOWS
+    if (isConsoleConnected)
+        return;
 
-	if (AttachConsole(ATTACH_PARENT_PROCESS) != FALSE)
-	{
-		freopen("CONIN$", "r", stdin);
-		freopen("CONOUT$", "w", stdout);
-		freopen("CONOUT$", "w", stderr);
-		isConsoleConnected = true;
-	}
-	#endif
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwFileType = GetFileType(hOut);
+
+    if (dwFileType == FILE_TYPE_UNKNOWN || dwFileType == FILE_TYPE_CHAR)
+    {
+        if (AttachConsole(ATTACH_PARENT_PROCESS) != FALSE)
+        {
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+            freopen("CONIN$", "r", stdin);
+            isConsoleConnected = true;
+        }
+    }
+    else
+    {
+        isConsoleConnected = true; 
+    }
+    #endif
 }
 
 void HandlePostUpdate()
@@ -192,7 +202,7 @@ void HandlePostUpdate()
 		HANDLE lock;
 		do
 		{
-			lock = CreateMutex(nullptr, TRUE, L"Global\\cemu_update_lock");
+			lock = CreateMutexW(nullptr, TRUE, L"Global\\cemu_update_lock");
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		} while (lock == nullptr);
 		const DWORD wait_result = WaitForSingleObject(lock, 2000);
@@ -220,7 +230,7 @@ void ToolShaderCacheMerger();
 #if BOOST_OS_WINDOWS
 
 // entrypoint for release builds
-int wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPTSTR lpCmdLine, _In_ int nShowCmd)
+int wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd)
 {
 	if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE)))
 		cemuLog_log(LogType::Force, "CoInitializeEx() failed");
